@@ -2,6 +2,7 @@
 
 
 use ./completer.nu
+use prelude.nu ["into iso-datestamp"]
 use ./error.nu *
 use ./token.nu
 use ./http.nu
@@ -64,11 +65,17 @@ def "fetch page" [] {
     let input = $in
 
     if (($input.url | is-not-empty) and ($input.allowance > 0)) {
-        let res = $input.url | fetch        
+        let res = $input.url | fetch
 
-        # TODO: Return the response body as a page record instead of failing.
         if ($res.status != 200) {
-            fail $"The request to GitHub failed with error ($res.status)"
+            return {
+                out: {
+                    status: $res.status
+                    url: $input.url
+                    error: $res.body
+                }
+                next: null
+            }
         }
 
         let out = {
@@ -78,6 +85,8 @@ def "fetch page" [] {
             next_url: ($res | http next)
             data: $res.body
         }
+
+        print $out
 
         {out: $out, next: {url: $out.next_url, allowance: $out.ratelimit.remaining}}
     }
@@ -119,7 +128,7 @@ export def "search" [
     | fetch all "search"
 }
 
-export def "pr list normalise" [] {
+export def "pull-request normalise" [] {
     $in
     | flatten
     | insert repository {|row|
@@ -138,42 +147,64 @@ export def "pr list normalise" [] {
     | insert source "github"
 }
 
-
-
-# Retrieves the list of merged Pull Requests since the given date for the given repositories.
-#
-# ```nu
-# GITHUB_TOKEN=$env.GITHUB_TOKEN_OP dial github pr list merged -s 2024-08-01 nushell/nushell nushell/nu_scripts
-# ```
-export def "pr list merged" [
-    --since (-s): datetime # Date from when PRs were merged. Defaults to today.
+# Retrieves the list of Pull Requests for the given query.
+export def "pull-request fetch" [
+    query: record        # Arbitrary search query.
     --direction: string@"completer pr_direction" = desc
     --per-page: int = 100
     --page: int = 1
-    query: record
 ] {
-    let since = if ($since | is-empty) { date now } else { $since }
-    let since_stamp = ($since | format date "%Y-%m-%d")
     let query = {
         type: pr
-        is: merged
-        merged: $">=($since_stamp)"
     } | merge $query
 
     search --direction $direction --per-page $per_page --page $page $query
 }
 
-# NOTE: merged PRs have created_at and closed_at. Gives the full timespan.
-# For a complete timeline, use timeline_url instead. Provides a list of events
-#
-# TODO: Consider usin $in for full URL.
-export def "pr timeline" [repo: string, number: int] {
-    base-url
-    | http url join $"repos/($repo)/issues/($number)/timeline"
-    | fetch all "core"
+# Expects a fully qualified timeline URL.
+export def "pull-request timeline fetch" [] {
+    $in | fetch all "core"
 }
 
-# Expects a fully qualified timeline URL.
-export def "pr timeline-url" [] {
-    $in | fetch all "core"
+const allowlist_events = [
+    assigned        
+    closed
+    commented
+    # committed # XXX: This event is massively different from the rest.
+    convert_to_draft
+    merged
+    ready_for_review
+    renamed
+    reopened
+    review_dismissed
+    review_requested
+    review_request_removed
+    reviewed
+    unassigned
+]
+
+
+export def "pull-request timeline normalise" [] {
+    $in
+    | get data
+    | flatten
+    | reject id?
+    | upsert source github
+    | where { $in.event in $allowlist_events }
+    | upsert actor {|row|
+          match $row.event {
+              committed => $row.author?.email
+              commented | reviewed => $row.user?.login
+              _ => $row.actor?.login
+          }
+      }
+    | insert timestamp {|row|
+          match $row.event {
+              committed => $row.author?.date
+              reviewed => $row.submitted_at
+              _ => $row.created_at
+          }
+      }
+    | rename --column {node_id: id}
+    | select id changeset_id repository timestamp event actor url? source
 }

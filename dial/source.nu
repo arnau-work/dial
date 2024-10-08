@@ -1,45 +1,37 @@
 # Managing data fetched from sources such as GitHub.
 use config.nu *
+use prelude.nu ["into iso-datestamp", "into iso-timestamp"]
 use github.nu
 use jira.nu
 use duckdb.nu
 use storage.nu
 
-const allowlist_events = [
-    assigned        
-    closed
-    commented
-    committed
-    convert_to_draft
-    merged
-    ready_for_review
-    renamed
-    reopened
-    review_dismissed
-    review_requested
-    review_request_removed
-    reviewed
-    unassigned
-]
 
-# Fetches merged GitHub Pull Request for the team organisations for the given date
-# range. The result is persisted in `changeset`.
-export def "changeset fetch" [start_date: datetime, end_date: datetime, team: string@"team list names"] {
-    let orgs = team orgs $team
-    let start_date = ($start_date | format date "%F")
-    let end_date = ($end_date | format date "%F")
+# Fetches changesets for a single team time-window (see `team time-window`).
+export def "changeset fetch-window" [window: record] {
+    let orgs = $window.orgs
+    let start_date = ($window.start_date | into iso-datestamp)
+    let end_date = ($window.end_date | into iso-datestamp)
 
-    let res = github pr list merged -s $start_date {org: $orgs}
+    let handles = ($window.members | get github_handle)
+    let query = {
+        org: $orgs
+        author: $handles
+        is: merged
+        merged: $"($start_date)..($end_date)"
+    }
+
+    let res = github pull-request fetch $query
 
     # Soft abort if at least one request failed.
-    # TODO: review fail path
+    # TODO: review fail path for 422
     if ($res | where status != 200 | is-not-empty) {
         return $res
     }
 
     $res
     | get data.items
-    | github pr list normalise
+    | github pull-request normalise
     | tee {
           if ($in | is-not-empty) { $in | storage save changeset }
       }
@@ -49,58 +41,43 @@ export def "changeset fetch" [start_date: datetime, end_date: datetime, team: st
           {
               table: changeset
               count: ($items | length)
-              start_date: $start_date
-              end_date: $end_date
+              start_date: $window.start_date
+              end_date: $window.end_date
           }
       }
+}
+
+# Fetches merged GitHub Pull Request for the team organisations for the given date
+# range. The result is persisted in `changeset`.
+export def "changeset fetch" [start_date: datetime, end_date: datetime, team: string@"team list names"] {
+    team time-windows $start_date $end_date $team
+    | each {|window| changeset fetch-window $window }
 }
 
 # Fetches the timelines for any changeset stored for the given date range.
 # The result is persisted in `changeset_timeline`.
 export def "changeset timeline fetch" [start_date: datetime, end_date: datetime] {
-    let start_date = $start_date | format date "%F"
-    let end_date = $end_date | format date "%F"
+    let start_date = ($start_date | into iso-datestamp)
+    let end_date = ($end_date | into iso-datestamp)
 
     storage query $"select * from changeset where resolution_date >= date '($start_date)' and resolution_date <= date '($end_date)'"
-    | par-each {|row|
+    | each {|row|
           $row.timeline_url
-          | github pr timeline-url
-          | get data
-          | flatten
-          | reject id?
-          | insert changeset_id $row.id
-          | insert repository $row.repository
-          | upsert source github
-      }
-    | flatten
-    | collect
-    | where { $in.event in $allowlist_events }
-    | upsert actor {|row|
-          match $row.event {
-              committed => $row.author.email
-              commented | reviewed => $row.user.login
-              _ => $row.actor.login
-          }
-      }
-    | insert timestamp {|row|
-          match $row.event {
-              committed => $row.author.date
-              reviewed => $row.submitted_at
-              _ => $row.created_at
-          }
-      }
-    | rename --column {node_id: id}
-    | select id changeset_id repository timestamp event actor url? source
-    | tee { if ($in | is-not-empty) { $in | storage save changeset_event } }
-    | do {
-          let items = $in
+          | github pull-request timeline fetch
+          | insert data.changeset_id $row.id
+          | insert data.repository $row.repository
+          | github pull-request timeline normalise
+          | tee { if ($in | is-not-empty) { $in | storage save changeset_event } }
+          | do {
+                let items = $in
 
-          {
-              table: changeset_event
-              count: ($items | length)
-              start_date: $start_date
-              end_date: $end_date
-          }
+                {
+                    table: changeset_event
+                    count: ($items | length)
+                    start_date: $start_date
+                    end_date: $end_date
+                }
+            }
       }
 }
 

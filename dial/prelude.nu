@@ -30,6 +30,14 @@ export def "date to-weeknumber" []: [string -> int, datetime -> int, list<string
     }
 }
 
+export def "into iso-datestamp" []: [datetime -> string] {
+    $in | format date "%F"
+}
+
+export def "into iso-timestamp" []: [datetime -> string] {
+    $in | format date "%+"
+}
+
 
 # A wrapper for the std open to bring opening parquet files into scope.
 export def open [
